@@ -245,7 +245,7 @@ def categorize_complaint(student_message: str) -> dict:
             "confidence":     confidence,
             "flag":           1,
             "message": (
-                f"Chill! I can notify the {category} department "
+                f"Just be alright, I can notify the {category} department "
                 f"and register your complaint. Do you want to proceed?"
             ),
             "buttons": ["Yes", "No"]
