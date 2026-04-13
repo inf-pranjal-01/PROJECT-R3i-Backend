@@ -8,9 +8,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GMAIL_USER     = os.getenv("GMAIL_USER")
-GMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-
 
 # ──────────────────────────────────────────────────────────────
 # CORE SEND FUNCTION
@@ -18,21 +15,32 @@ GMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 def send_email(to: str, subject: str, html: str):
     """Single send function. All email calls go through here."""
-    if not GMAIL_USER or not GMAIL_PASSWORD:
-        print("[EMAIL] Skipped — GMAIL_USER or GMAIL_APP_PASSWORD not set in .env")
+
+    # Read on every call — NOT at module load time.
+    # On Render, module-level os.getenv() can fire before env vars are injected,
+    # leaving both variables as None permanently and silently skipping all emails.
+    gmail_user     = os.getenv("GMAIL_USER")
+    gmail_password = os.getenv("GMAIL_APP_PASSWORD")
+
+    print(f"[EMAIL] Attempting send → to={to!r}  user_set={bool(gmail_user)}  pass_set={bool(gmail_password)}")
+
+    if not gmail_user or not gmail_password:
+        print("[EMAIL] Skipped — GMAIL_USER or GMAIL_APP_PASSWORD not set in environment")
         return
 
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"]    = f"Project R3i: <{GMAIL_USER}>"
+        msg["From"]    = f"Project R3i <{gmail_user}>"
         msg["To"]      = to
         msg.attach(MIMEText(html, "html"))
 
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
-            server.login(GMAIL_USER, GMAIL_PASSWORD)
-            server.sendmail(GMAIL_USER, to, msg.as_string())
+            server.login(gmail_user, gmail_password)
+            server.sendmail(gmail_user, to, msg.as_string())
+
+        print(f"[EMAIL] Sent successfully → {to}")
 
     except Exception as e:
         # Email failure never crashes the main flow
