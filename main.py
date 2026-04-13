@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -11,7 +11,10 @@ from r3i_agent import (
     register_complaint,
     cancel_registration,
     admin_send_message,
-    student_reply
+    student_reply,
+    send_new_complaint_email,
+    send_admin_replied_email,
+    send_student_replied_email,
 )
 from firebase_client import db
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
@@ -63,7 +66,7 @@ class OnboardRequest(BaseModel):
     category:      Optional[str] = ""
 
 class TestEmailRequest(BaseModel):
-    to: str   # send a test email to this address
+    to: str
 
 
 # ── Routes ───────────────────────────────────────────────────────────────
@@ -85,14 +88,19 @@ def route_select_category(req: ManualCategoryRequest):
 
 
 @app.post("/chat/register")
-def route_register(req: RegisterRequest):
+def route_register(req: RegisterRequest, background_tasks: BackgroundTasks):
     try:
         category_data = {
             "category":    req.category,
             "short_title": req.short_title,
             "confidence":  req.confidence,
         }
-        return register_complaint(req.student_id, category_data, req.raw_message)
+        response, email_kwargs = register_complaint(req.student_id, category_data, req.raw_message)
+
+        if email_kwargs:
+            background_tasks.add_task(send_new_complaint_email, **email_kwargs)
+
+        return response
     except Exception as e:
         return {"error": str(e)}
 
@@ -103,17 +111,27 @@ def route_cancel():
 
 
 @app.post("/admin/message")
-def route_admin_message(req: AdminMessageRequest):
+def route_admin_message(req: AdminMessageRequest, background_tasks: BackgroundTasks):
     try:
-        return admin_send_message(req.complaint_id, req.response, req.status_update)
+        response, email_kwargs = admin_send_message(req.complaint_id, req.response, req.status_update)
+
+        if email_kwargs:
+            background_tasks.add_task(send_admin_replied_email, **email_kwargs)
+
+        return response
     except Exception as e:
         return {"error": str(e)}
 
 
 @app.post("/chat/reply")
-def route_student_reply(req: StudentReplyRequest):
+def route_student_reply(req: StudentReplyRequest, background_tasks: BackgroundTasks):
     try:
-        return student_reply(req.complaint_id, req.message)
+        response, email_kwargs = student_reply(req.complaint_id, req.message)
+
+        if email_kwargs:
+            background_tasks.add_task(send_student_replied_email, **email_kwargs)
+
+        return response
     except Exception as e:
         return {"error": str(e)}
 
@@ -137,7 +155,7 @@ def route_onboard(req: OnboardRequest):
         if req.role == "admin" and req.category:
             db.collection("category_routing").document(req.category).set({
                 "adminId":    req.uid,
-                "adminEmail": req.email,
+                "adminEmail": req.email,   # always keep this in sync
             })
 
         return {"success": True}
@@ -179,22 +197,59 @@ def route_get_categories():
     return {"categories": CATEGORIES}
 
 
+# ── Fix existing category_routing docs missing adminEmail ────────────────────
+# Hit once from Render shell or Postman if you had admins onboarded before
+# this fix. It back-fills adminEmail from the users collection.
+#
+# POST /admin/fix-routing
+@app.post("/admin/fix-routing")
+def route_fix_routing():
+    """
+    One-time repair: for every category_routing doc that is missing adminEmail,
+    look up the admin's email from the users collection and patch it in.
+    """
+    try:
+        fixed   = []
+        skipped = []
+        docs    = db.collection("category_routing").stream()
+
+        for doc in docs:
+            data        = doc.to_dict()
+            admin_id    = data.get("adminId", "")
+            admin_email = data.get("adminEmail", "").strip()
+
+            if admin_email:
+                skipped.append(doc.id)
+                continue
+
+            if not admin_id or admin_id == "unassigned":
+                skipped.append(doc.id)
+                continue
+
+            user_doc = db.collection("users").document(admin_id).get()
+            if not user_doc.exists:
+                skipped.append(doc.id)
+                continue
+
+            email = (user_doc.to_dict() or {}).get("email", "").strip()
+            if email:
+                db.collection("category_routing").document(doc.id).update({"adminEmail": email})
+                fixed.append({"category": doc.id, "adminEmail": email})
+            else:
+                skipped.append(doc.id)
+
+        return {"fixed": fixed, "skipped": skipped}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── Email Diagnostic ─────────────────────────────────────────────────────
-# Hit this endpoint from Render's shell or from curl/Postman to verify that
-# GMAIL_USER + GMAIL_APP_PASSWORD are loaded correctly and SMTP works.
-#
-# Usage:
-#   POST /test-email
-#   { "to": "youremail@gmail.com" }
-#
-# Watch the Render logs for detailed output.
 @app.post("/test-email")
 def route_test_email(req: TestEmailRequest):
     import os
     gmail_user     = os.getenv("GMAIL_USER", "").strip()
     gmail_password = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
 
-    # Report what Render actually sees — safe to log user, NOT password
     env_status = {
         "GMAIL_USER_set":      bool(gmail_user),
         "GMAIL_USER_value":    gmail_user,
@@ -214,9 +269,7 @@ def route_test_email(req: TestEmailRequest):
     if len(gmail_password) != 16:
         return {
             "success": False,
-            "reason":  f"App password is {len(gmail_password)} chars — must be exactly 16. "
-                       "Copy it from Google → Manage Account → Security → App Passwords. "
-                       "Paste WITHOUT spaces.",
+            "reason":  f"App password is {len(gmail_password)} chars — must be exactly 16.",
             "env_status": env_status,
         }
 
@@ -240,24 +293,9 @@ def route_test_email(req: TestEmailRequest):
             server.sendmail(gmail_user, req.to, msg.as_string())
 
         print(f"[TEST-EMAIL] ✓ Test email sent to {req.to}")
-        return {
-            "success":    True,
-            "message":    f"Test email sent to {req.to}. Check your inbox (and spam).",
-            "env_status": env_status,
-        }
+        return {"success": True, "message": f"Test email sent to {req.to}.", "env_status": env_status}
 
     except smtplib.SMTPAuthenticationError as e:
-        return {
-            "success": False,
-            "reason":  f"SMTPAuthenticationError: {e}. "
-                       "Make sure 2-Step Verification is ON and you are using an App Password, "
-                       "NOT your regular Gmail password. "
-                       "Generate one at https://myaccount.google.com/apppasswords",
-            "env_status": env_status,
-        }
+        return {"success": False, "reason": f"SMTPAuthenticationError: {e}", "env_status": env_status}
     except Exception as e:
-        return {
-            "success": False,
-            "reason":  str(e),
-            "env_status": env_status,
-        }
+        return {"success": False, "reason": str(e), "env_status": env_status}

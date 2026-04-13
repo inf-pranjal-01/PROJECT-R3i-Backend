@@ -1,5 +1,5 @@
 # r3i_agent.py
-import os, json, uuid, threading
+import os, json, uuid
 from dotenv import load_dotenv
 import requests
 from firebase_client import db
@@ -148,8 +148,32 @@ def parse_json(raw: str) -> dict:
 
 
 def get_assigned_admin(category: str) -> dict:
+    """
+    Returns routing info for the given category.
+    If adminEmail is missing from category_routing, falls back to looking
+    up the admin's email directly from the users collection.
+    """
     doc = db.collection("category_routing").document(category).get()
-    return doc.to_dict() if doc.exists else {"adminId": "unassigned", "adminEmail": ""}
+    if not doc.exists:
+        print(f"[ROUTING] No routing doc found for category={category!r}")
+        return {"adminId": "unassigned", "adminEmail": ""}
+
+    data = doc.to_dict()
+    admin_id    = data.get("adminId", "")
+    admin_email = data.get("adminEmail", "").strip()
+
+    # ── Fallback: email missing in routing → look it up from users collection ──
+    if not admin_email and admin_id and admin_id != "unassigned":
+        print(f"[ROUTING] adminEmail missing in category_routing for {category!r}. "
+              f"Falling back to users/{admin_id}")
+        user_doc = db.collection("users").document(admin_id).get()
+        if user_doc.exists:
+            admin_email = (user_doc.to_dict() or {}).get("email", "").strip()
+            print(f"[ROUTING] Fallback email resolved → {admin_email!r}")
+        else:
+            print(f"[ROUTING] users/{admin_id} not found either — email will be empty")
+
+    return {"adminId": admin_id, "adminEmail": admin_email}
 
 
 def get_admin_info(admin_id: str) -> dict:
@@ -181,7 +205,7 @@ def fetch_last_n_messages(complaint_id: str, n: int = 5) -> list:
             .stream()
         )
         all_msgs = [d.to_dict() for d in docs]
-        return all_msgs[-n:]          # keep only the last N
+        return all_msgs[-n:]
     except Exception as e:
         print(f"[CONTEXT FETCH ERROR] {e}")
         return []
@@ -193,7 +217,6 @@ def enhance_message_with_context(raw_message: str, context_messages: list) -> st
     so the LLM understands the thread before rewriting the student's new reply.
     """
     if not context_messages:
-        # Fall back to simple enhancer if no history available
         return enhance_message(raw_message)
 
     history_lines = []
@@ -218,12 +241,88 @@ def enhance_message_with_context(raw_message: str, context_messages: list) -> st
     return call_ai(CONTEXT_ENHANCER_PROMPT, user_input).strip()
 
 
-def _fire_email(target, kwargs):
-    """Wrapper so any exception inside an email thread prints to Render logs."""
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL HELPERS
+# These are plain functions — no threading. FastAPI BackgroundTasks (in main.py)
+# handles running them off the critical path while staying ASGI-lifecycle-safe.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_new_complaint_email(
+    admin_email: str,
+    admin_name: str,
+    student: dict,
+    tracking_id: str,
+    category_data: dict,
+    enhanced_initial: str,
+):
+    """Send 'new complaint assigned' email to admin."""
     try:
-        target(**kwargs)
+        email_admin_new_complaint(
+            admin_email=admin_email,
+            admin_name=admin_name,
+            student_name=student.get("displayName", "Unknown"),
+            tracking_id=tracking_id,
+            category=category_data.get("category", "General"),
+            short_title=category_data.get("short_title", ""),
+            enhanced_message=enhanced_initial,
+            room_number=student.get("roomNumber", "N/A"),
+            contact_number=student.get("contactNumber", "N/A"),
+            roll_number=student.get("rollNumber", "N/A"),
+        )
     except Exception as e:
-        print(f"[EMAIL THREAD ERROR] {e}")
+        print(f"[EMAIL BG ERROR] send_new_complaint_email → {e}")
+
+
+def send_admin_replied_email(
+    student_email: str,
+    student_name: str,
+    tracking_id: str,
+    short_title: str,
+    response: str,
+    resolved: bool,
+):
+    """Send 'admin replied / resolved' email to student."""
+    try:
+        if resolved:
+            email_student_resolved(
+                student_email=student_email,
+                student_name=student_name,
+                tracking_id=tracking_id,
+                short_title=short_title,
+                admin_response=response,
+            )
+        else:
+            email_student_admin_replied(
+                student_email=student_email,
+                student_name=student_name,
+                tracking_id=tracking_id,
+                short_title=short_title,
+                admin_response=response,
+            )
+    except Exception as e:
+        print(f"[EMAIL BG ERROR] send_admin_replied_email → {e}")
+
+
+def send_student_replied_email(
+    admin_email: str,
+    admin_name: str,
+    student_name: str,
+    tracking_id: str,
+    short_title: str,
+    enhanced_reply: str,
+):
+    """Send 'student replied' email to admin."""
+    try:
+        email_admin_student_replied(
+            admin_email=admin_email,
+            admin_name=admin_name,
+            student_name=student_name,
+            tracking_id=tracking_id,
+            short_title=short_title,
+            enhanced_reply=enhanced_reply,
+        )
+    except Exception as e:
+        print(f"[EMAIL BG ERROR] send_student_replied_email → {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,12 +379,16 @@ def apply_manual_category(selected_category: str, short_title: str) -> dict:
     }
 
 
-def register_complaint(student_id: str, category_data: dict, raw_message: str) -> dict:
+def register_complaint(student_id: str, category_data: dict, raw_message: str) -> tuple[dict, dict | None]:
+    """
+    Returns (response_dict, email_kwargs_or_None).
+    The caller (main.py route) schedules the email as a BackgroundTask.
+    """
     tracking_id      = generate_tracking_id()
     student_doc      = db.collection("users").document(student_id).get()
     student          = student_doc.to_dict() if student_doc.exists else {}
     routing          = get_assigned_admin(category_data.get("category", "Other"))
-    enhanced_initial = enhance_message(raw_message)   # no context for first message
+    enhanced_initial = enhance_message(raw_message)
 
     complaint_ref = db.collection("complaints").document()
     complaint_ref.set({
@@ -315,34 +418,29 @@ def register_complaint(student_id: str, category_data: dict, raw_message: str) -
         "createdAt": SERVER_TIMESTAMP,
     })
 
-    # ── Fire-and-forget email ─────────────────────────────────────────────
+    # ── Prepare email kwargs (sent via BackgroundTask in main.py) ─────────
     admin_id    = routing.get("adminId", "")
-    admin_email = routing.get("adminEmail", "")
-    print(f"[EMAIL DEBUG] admin_id={admin_id!r}  admin_email={admin_email!r}")
+    admin_email = routing.get("adminEmail", "").strip()
 
+    print(f"[EMAIL DEBUG] register_complaint: admin_id={admin_id!r}  admin_email={admin_email!r}")
+
+    email_kwargs = None
     if admin_email and admin_id != "unassigned":
-        admin_info = get_admin_info(admin_id)
-        threading.Thread(
-            target=_fire_email,
-            args=(email_admin_new_complaint, {
-                "admin_email":      admin_email,
-                "admin_name":       admin_info.get("displayName", "Admin"),
-                "student_name":     student.get("displayName", "Unknown"),
-                "tracking_id":      tracking_id,
-                "category":         category_data.get("category", "General"),
-                "short_title":      category_data.get("short_title", ""),
-                "enhanced_message": enhanced_initial,
-                "room_number":      student.get("roomNumber", "N/A"),
-                "contact_number":   student.get("contactNumber", "N/A"),
-                "roll_number":      student.get("rollNumber", "N/A"),
-            }),
-            daemon=False,
-        ).start()
+        admin_info   = get_admin_info(admin_id)
+        email_kwargs = {
+            "admin_email":      admin_email,
+            "admin_name":       admin_info.get("displayName", "Admin"),
+            "student":          student,
+            "tracking_id":      tracking_id,
+            "category_data":    category_data,
+            "enhanced_initial": enhanced_initial,
+        }
     else:
-        print("[EMAIL DEBUG] Skipped — no admin routed for this category or email missing")
+        print(f"[EMAIL DEBUG] Skipped — admin_email empty or admin unassigned "
+              f"(admin_id={admin_id!r}, admin_email={admin_email!r})")
 
     category = category_data.get("category", "General")
-    return {
+    response = {
         "message": (
             f"Done! Your complaint has been registered under the "
             f"{category} category. "
@@ -353,6 +451,7 @@ def register_complaint(student_id: str, category_data: dict, raw_message: str) -
         "studentFlag":      "yellow",
         "buttons":          []
     }
+    return response, email_kwargs
 
 
 def cancel_registration() -> dict:
@@ -362,7 +461,11 @@ def cancel_registration() -> dict:
     }
 
 
-def admin_send_message(complaint_id: str, response: str, status_update: str) -> dict:
+def admin_send_message(complaint_id: str, response: str, status_update: str) -> tuple[dict, dict | None]:
+    """
+    Returns (response_dict, email_kwargs_or_None).
+    The caller schedules the email as a BackgroundTask.
+    """
     if status_update == "resolved":
         student_flag = "green"
         admin_flag   = "green"
@@ -390,43 +493,33 @@ def admin_send_message(complaint_id: str, response: str, status_update: str) -> 
         "lastUpdated":   SERVER_TIMESTAMP,
     })
 
-    # ── Fire-and-forget email ─────────────────────────────────────────────
-    student_email = complaint_data.get("email", "")
+    student_email = complaint_data.get("email", "").strip()
+    print(f"[EMAIL DEBUG] admin_send_message: student_email={student_email!r}  status={status_update!r}")
+
+    email_kwargs = None
     if student_email:
-        if status_update == "resolved":
-            threading.Thread(
-                target=_fire_email,
-                args=(email_student_resolved, {
-                    "student_email":  student_email,
-                    "student_name":   complaint_data.get("studentName", "Student"),
-                    "tracking_id":    complaint_data.get("trackingId", ""),
-                    "short_title":    complaint_data.get("shortTitle", ""),
-                    "admin_response": response,
-                }),
-                daemon=False,
-            ).start()
-        else:
-            threading.Thread(
-                target=_fire_email,
-                args=(email_student_admin_replied, {
-                    "student_email":  student_email,
-                    "student_name":   complaint_data.get("studentName", "Student"),
-                    "tracking_id":    complaint_data.get("trackingId", ""),
-                    "short_title":    complaint_data.get("shortTitle", ""),
-                    "admin_response": response,
-                }),
-                daemon=False,
-            ).start()
+        email_kwargs = {
+            "student_email": student_email,
+            "student_name":  complaint_data.get("studentName", "Student"),
+            "tracking_id":   complaint_data.get("trackingId", ""),
+            "short_title":   complaint_data.get("shortTitle", ""),
+            "response":      response,
+            "resolved":      status_update == "resolved",
+        }
+    else:
+        print("[EMAIL DEBUG] Skipped — student email missing from complaint document")
 
-    return {"success": True}
+    return {"success": True}, email_kwargs
 
 
-def student_reply(complaint_id: str, raw_message: str) -> dict:
-    # ── Fetch last 5 messages for context ────────────────────────────────
+def student_reply(complaint_id: str, raw_message: str) -> tuple[dict, dict | None]:
+    """
+    Returns (response_dict, email_kwargs_or_None).
+    The caller schedules the email as a BackgroundTask.
+    """
     context_messages = fetch_last_n_messages(complaint_id, n=5)
     print(f"[CONTEXT] Fetched {len(context_messages)} messages for complaint {complaint_id}")
 
-    # ── Context-aware enhancement ─────────────────────────────────────────
     enhanced = enhance_message_with_context(raw_message, context_messages)
 
     complaint_ref  = db.collection("complaints").document(complaint_id)
@@ -446,27 +539,30 @@ def student_reply(complaint_id: str, raw_message: str) -> dict:
         "lastUpdated": SERVER_TIMESTAMP,
     })
 
-    # ── Fire-and-forget email ─────────────────────────────────────────────
     admin_id = complaint_data.get("assignedAdminId", "")
+    print(f"[EMAIL DEBUG] student_reply: admin_id={admin_id!r}")
+
+    email_kwargs = None
     if admin_id and admin_id != "unassigned":
         admin_info  = get_admin_info(admin_id)
-        admin_email = admin_info.get("email", "")
+        admin_email = admin_info.get("email", "").strip()
+        print(f"[EMAIL DEBUG] student_reply: admin_email={admin_email!r}")
         if admin_email:
-            threading.Thread(
-                target=_fire_email,
-                args=(email_admin_student_replied, {
-                    "admin_email":    admin_email,
-                    "admin_name":     admin_info.get("displayName", "Admin"),
-                    "student_name":   complaint_data.get("studentName", "Student"),
-                    "tracking_id":    complaint_data.get("trackingId", ""),
-                    "short_title":    complaint_data.get("shortTitle", ""),
-                    "enhanced_reply": enhanced,
-                }),
-                daemon=False,
-            ).start()
+            email_kwargs = {
+                "admin_email":    admin_email,
+                "admin_name":     admin_info.get("displayName", "Admin"),
+                "student_name":   complaint_data.get("studentName", "Student"),
+                "tracking_id":    complaint_data.get("trackingId", ""),
+                "short_title":    complaint_data.get("shortTitle", ""),
+                "enhanced_reply": enhanced,
+            }
+        else:
+            print("[EMAIL DEBUG] Skipped — admin email missing from users document")
+    else:
+        print(f"[EMAIL DEBUG] Skipped — no assigned admin (admin_id={admin_id!r})")
 
     return {
         "enhanced_message": enhanced,
         "studentFlag":      "yellow",
         "adminFlag":        "red"
-    }
+    }, email_kwargs
