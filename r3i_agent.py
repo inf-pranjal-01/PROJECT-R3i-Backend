@@ -100,6 +100,37 @@ Input:  "bro wifi not working from 2 week pls do smthing fast"
 Output: "The WiFi has not been working for the past 2 weeks. Please take action at the earliest."
 """
 
+CONTEXT_ENHANCER_PROMPT = """
+You are a message enhancer for a college complaint system.
+You are given the recent conversation history between a student and an admin,
+followed by the student's new reply.
+
+YOUR ONLY JOB:
+- Rewrite the student's NEW reply in clear, formal English.
+- Use the conversation history ONLY to understand the context — do NOT repeat or summarise it.
+- Fix grammar, spelling, and clarity of the new reply.
+- Keep the original meaning exactly. Do not add new information.
+- Output ONLY the enhanced version of the new reply as plain text. Nothing else.
+- Maximum 3 sentences.
+
+FORMAT OF INPUT YOU WILL RECEIVE:
+---CONVERSATION HISTORY (last 5 messages, oldest first)---
+[Student]: <message>
+[Admin]: <message>
+... (up to 5 messages)
+---NEW STUDENT REPLY---
+<raw reply>
+
+EXAMPLE:
+---CONVERSATION HISTORY---
+[Student]: The WiFi has not been working for the past two weeks.
+[Admin]: Please share the specific floor and block where you are experiencing this issue.
+---NEW STUDENT REPLY---
+bro its 3rd floor block c whole area no wifi
+OUTPUT:
+The issue is on the third floor of Block C, where the entire area is without WiFi connectivity.
+"""
+
 
 def parse_json(raw: str) -> dict:
     raw = raw.strip()
@@ -115,19 +146,76 @@ def parse_json(raw: str) -> dict:
             "flag":        1
         }
 
+
 def get_assigned_admin(category: str) -> dict:
     doc = db.collection("category_routing").document(category).get()
     return doc.to_dict() if doc.exists else {"adminId": "unassigned", "adminEmail": ""}
+
 
 def get_admin_info(admin_id: str) -> dict:
     doc = db.collection("users").document(admin_id).get()
     return doc.to_dict() if doc.exists else {"displayName": "Admin", "email": ""}
 
+
 def generate_tracking_id() -> str:
     return "#" + str(uuid.uuid4())[:6].upper()
 
+
 def enhance_message(raw_message: str) -> str:
+    """Simple enhancer — no context. Used for the first student message."""
     return call_ai(ENHANCER_PROMPT, raw_message).strip()
+
+
+def fetch_last_n_messages(complaint_id: str, n: int = 5) -> list:
+    """
+    Fetches the last N messages from the complaint's messages subcollection,
+    ordered by createdAt ascending so the oldest of the batch comes first.
+    Returns a list of dicts.
+    """
+    try:
+        docs = (
+            db.collection("complaints")
+            .document(complaint_id)
+            .collection("messages")
+            .order_by("createdAt")
+            .stream()
+        )
+        all_msgs = [d.to_dict() for d in docs]
+        return all_msgs[-n:]          # keep only the last N
+    except Exception as e:
+        print(f"[CONTEXT FETCH ERROR] {e}")
+        return []
+
+
+def enhance_message_with_context(raw_message: str, context_messages: list) -> str:
+    """
+    Context-aware enhancer. Builds a prompt that includes the last N messages
+    so the LLM understands the thread before rewriting the student's new reply.
+    """
+    if not context_messages:
+        # Fall back to simple enhancer if no history available
+        return enhance_message(raw_message)
+
+    history_lines = []
+    for msg in context_messages:
+        msg_type = msg.get("type", "")
+        if msg_type == "student":
+            text = msg.get("enhanced") or msg.get("raw", "")
+            history_lines.append(f"[Student]: {text}")
+        elif msg_type == "admin":
+            text = msg.get("response", "")
+            history_lines.append(f"[Admin]: {text}")
+
+    history_str = "\n".join(history_lines)
+
+    user_input = (
+        f"---CONVERSATION HISTORY (last {len(context_messages)} messages, oldest first)---\n"
+        f"{history_str}\n"
+        f"---NEW STUDENT REPLY---\n"
+        f"{raw_message}"
+    )
+
+    return call_ai(CONTEXT_ENHANCER_PROMPT, user_input).strip()
 
 
 def _fire_email(target, kwargs):
@@ -137,6 +225,10 @@ def _fire_email(target, kwargs):
     except Exception as e:
         print(f"[EMAIL THREAD ERROR] {e}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def categorize_complaint(student_message: str) -> dict:
     raw         = call_ai(CATEGORIZATION_PROMPT, student_message)
@@ -193,7 +285,7 @@ def register_complaint(student_id: str, category_data: dict, raw_message: str) -
     student_doc      = db.collection("users").document(student_id).get()
     student          = student_doc.to_dict() if student_doc.exists else {}
     routing          = get_assigned_admin(category_data.get("category", "Other"))
-    enhanced_initial = enhance_message(raw_message)
+    enhanced_initial = enhance_message(raw_message)   # no context for first message
 
     complaint_ref = db.collection("complaints").document()
     complaint_ref.set({
@@ -224,11 +316,10 @@ def register_complaint(student_id: str, category_data: dict, raw_message: str) -
     })
 
     # ── Fire-and-forget email ─────────────────────────────────────────────
-    # daemon=False is critical — daemon threads are killed the moment the
-    # HTTP response is sent; non-daemon threads finish even after the response.
     admin_id    = routing.get("adminId", "")
     admin_email = routing.get("adminEmail", "")
     print(f"[EMAIL DEBUG] admin_id={admin_id!r}  admin_email={admin_email!r}")
+
     if admin_email and admin_id != "unassigned":
         admin_info = get_admin_info(admin_id)
         threading.Thread(
@@ -245,7 +336,7 @@ def register_complaint(student_id: str, category_data: dict, raw_message: str) -
                 "contact_number":   student.get("contactNumber", "N/A"),
                 "roll_number":      student.get("rollNumber", "N/A"),
             }),
-            daemon=False,   # ← non-daemon: thread outlives the HTTP response
+            daemon=False,
         ).start()
     else:
         print("[EMAIL DEBUG] Skipped — no admin routed for this category or email missing")
@@ -299,7 +390,7 @@ def admin_send_message(complaint_id: str, response: str, status_update: str) -> 
         "lastUpdated":   SERVER_TIMESTAMP,
     })
 
-    # ── Fire-and-forget email — daemon=False ──────────────────────────────
+    # ── Fire-and-forget email ─────────────────────────────────────────────
     student_email = complaint_data.get("email", "")
     if student_email:
         if status_update == "resolved":
@@ -331,7 +422,13 @@ def admin_send_message(complaint_id: str, response: str, status_update: str) -> 
 
 
 def student_reply(complaint_id: str, raw_message: str) -> dict:
-    enhanced       = enhance_message(raw_message)
+    # ── Fetch last 5 messages for context ────────────────────────────────
+    context_messages = fetch_last_n_messages(complaint_id, n=5)
+    print(f"[CONTEXT] Fetched {len(context_messages)} messages for complaint {complaint_id}")
+
+    # ── Context-aware enhancement ─────────────────────────────────────────
+    enhanced = enhance_message_with_context(raw_message, context_messages)
+
     complaint_ref  = db.collection("complaints").document(complaint_id)
     complaint_data = complaint_ref.get().to_dict() or {}
 
@@ -349,7 +446,7 @@ def student_reply(complaint_id: str, raw_message: str) -> dict:
         "lastUpdated": SERVER_TIMESTAMP,
     })
 
-    # ── Fire-and-forget email — daemon=False ──────────────────────────────
+    # ── Fire-and-forget email ─────────────────────────────────────────────
     admin_id = complaint_data.get("assignedAdminId", "")
     if admin_id and admin_id != "unassigned":
         admin_info  = get_admin_info(admin_id)

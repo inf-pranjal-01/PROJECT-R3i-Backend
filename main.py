@@ -18,7 +18,6 @@ from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
 app = FastAPI()
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,13 +34,11 @@ class CategorizeRequest(BaseModel):
 
 class ManualCategoryRequest(BaseModel):
     selected_category: str
-    short_title:       str   # frontend sends back what it got from /chat/categorize
+    short_title:       str
 
 class RegisterRequest(BaseModel):
     student_id:  str
     raw_message: str
-    # Frontend sends back exactly what it received from
-    # /chat/categorize OR /chat/select-category — same shape either way
     category:    str
     short_title: str
     confidence:  float
@@ -63,14 +60,14 @@ class OnboardRequest(BaseModel):
     rollNumber:    Optional[str] = ""
     roomNumber:    Optional[str] = ""
     contactNumber: Optional[str] = ""
-    category:      Optional[str] = ""   # admin only
+    category:      Optional[str] = ""
+
+class TestEmailRequest(BaseModel):
+    to: str   # send a test email to this address
 
 
 # ── Routes ───────────────────────────────────────────────────────────────
 
-# STEP 1 — LLM categorizes
-#   high confidence → { low_confidence:false, category, short_title, message, buttons:["Yes","No"] }
-#   low confidence  → { low_confidence:true, short_title, message, buttons:[7 categories] }
 @app.post("/chat/categorize")
 def route_categorize(req: CategorizeRequest):
     try:
@@ -79,9 +76,6 @@ def route_categorize(req: CategorizeRequest):
         return {"error": str(e)}
 
 
-# STEP 1B — User picked a category manually (low confidence path only)
-# Frontend sends back: selected_category + short_title (from step 1 response)
-# Returns same shape as high-confidence /chat/categorize → same Yes/No flow
 @app.post("/chat/select-category")
 def route_select_category(req: ManualCategoryRequest):
     try:
@@ -90,8 +84,6 @@ def route_select_category(req: ManualCategoryRequest):
         return {"error": str(e)}
 
 
-# STEP 2A — Student clicked Yes → register complaint
-# Enhancer runs on initial message before Firestore write
 @app.post("/chat/register")
 def route_register(req: RegisterRequest):
     try:
@@ -105,16 +97,11 @@ def route_register(req: RegisterRequest):
         return {"error": str(e)}
 
 
-# STEP 2B — Student clicked No
 @app.post("/chat/cancel")
 def route_cancel():
     return cancel_registration()
 
 
-# STEP 3A — Admin sends message or marks resolved
-# status_update: "action" → student needs to respond
-# status_update: "resolved" → chat is closed, both sides green
-# Only admin ever calls this — student has no route to change status
 @app.post("/admin/message")
 def route_admin_message(req: AdminMessageRequest):
     try:
@@ -123,8 +110,6 @@ def route_admin_message(req: AdminMessageRequest):
         return {"error": str(e)}
 
 
-# STEP 3B — Student replies to admin's message
-# Enhancer runs. Admin sees enhanced version via Firestore onSnapshot.
 @app.post("/chat/reply")
 def route_student_reply(req: StudentReplyRequest):
     try:
@@ -133,8 +118,6 @@ def route_student_reply(req: StudentReplyRequest):
         return {"error": str(e)}
 
 
-# ONBOARDING — Save user profile after Google login
-# If admin, also writes into category_routing
 @app.post("/onboard")
 def route_onboard(req: OnboardRequest):
     try:
@@ -162,8 +145,6 @@ def route_onboard(req: OnboardRequest):
         return {"error": str(e)}
 
 
-# GET — All complaints assigned to an admin (for dashboard on load)
-# onSnapshot handles live updates after first load
 @app.get("/admin/complaints/{admin_id}")
 def route_get_admin_complaints(admin_id: str):
     try:
@@ -178,7 +159,6 @@ def route_get_admin_complaints(admin_id: str):
         return {"error": str(e)}
 
 
-# GET — Messages subcollection for a complaint (for rendering chat history)
 @app.get("/complaint/{complaint_id}/messages")
 def route_get_messages(complaint_id: str):
     try:
@@ -194,7 +174,90 @@ def route_get_messages(complaint_id: str):
         return {"error": str(e)}
 
 
-# GET — All categories (for frontend dropdowns, admin filters, etc.)
 @app.get("/categories")
 def route_get_categories():
     return {"categories": CATEGORIES}
+
+
+# ── Email Diagnostic ─────────────────────────────────────────────────────
+# Hit this endpoint from Render's shell or from curl/Postman to verify that
+# GMAIL_USER + GMAIL_APP_PASSWORD are loaded correctly and SMTP works.
+#
+# Usage:
+#   POST /test-email
+#   { "to": "youremail@gmail.com" }
+#
+# Watch the Render logs for detailed output.
+@app.post("/test-email")
+def route_test_email(req: TestEmailRequest):
+    import os
+    gmail_user     = os.getenv("GMAIL_USER", "").strip()
+    gmail_password = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+
+    # Report what Render actually sees — safe to log user, NOT password
+    env_status = {
+        "GMAIL_USER_set":      bool(gmail_user),
+        "GMAIL_USER_value":    gmail_user,
+        "APP_PASSWORD_set":    bool(gmail_password),
+        "APP_PASSWORD_length": len(gmail_password),
+        "APP_PASSWORD_is_16":  len(gmail_password) == 16,
+    }
+    print(f"[TEST-EMAIL] env_status={env_status}")
+
+    if not gmail_user or not gmail_password:
+        return {
+            "success": False,
+            "reason":  "Env vars missing on Render. Add GMAIL_USER and GMAIL_APP_PASSWORD in Environment settings.",
+            "env_status": env_status,
+        }
+
+    if len(gmail_password) != 16:
+        return {
+            "success": False,
+            "reason":  f"App password is {len(gmail_password)} chars — must be exactly 16. "
+                       "Copy it from Google → Manage Account → Security → App Passwords. "
+                       "Paste WITHOUT spaces.",
+            "env_status": env_status,
+        }
+
+    try:
+        import smtplib, ssl
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "[R3i] Test Email — SMTP working ✓"
+        msg["From"]    = f"Project R3i <{gmail_user}>"
+        msg["To"]      = req.to
+        msg.attach(MIMEText(
+            "<p>If you can read this, your R3i email setup is working correctly. 🎉</p>",
+            "html"
+        ))
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(gmail_user, gmail_password)
+            server.sendmail(gmail_user, req.to, msg.as_string())
+
+        print(f"[TEST-EMAIL] ✓ Test email sent to {req.to}")
+        return {
+            "success":    True,
+            "message":    f"Test email sent to {req.to}. Check your inbox (and spam).",
+            "env_status": env_status,
+        }
+
+    except smtplib.SMTPAuthenticationError as e:
+        return {
+            "success": False,
+            "reason":  f"SMTPAuthenticationError: {e}. "
+                       "Make sure 2-Step Verification is ON and you are using an App Password, "
+                       "NOT your regular Gmail password. "
+                       "Generate one at https://myaccount.google.com/apppasswords",
+            "env_status": env_status,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "reason":  str(e),
+            "env_status": env_status,
+        }
