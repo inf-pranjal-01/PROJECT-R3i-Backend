@@ -130,10 +130,18 @@ def enhance_message(raw_message: str) -> str:
     return call_ai(ENHANCER_PROMPT, raw_message).strip()
 
 
+def _fire_email(target, kwargs):
+    """Wrapper so any exception inside an email thread prints to Render logs."""
+    try:
+        target(**kwargs)
+    except Exception as e:
+        print(f"[EMAIL THREAD ERROR] {e}")
+
+
 def categorize_complaint(student_message: str) -> dict:
-    raw        = call_ai(CATEGORIZATION_PROMPT, student_message)
-    data       = parse_json(raw)
-    confidence = data.get("confidence", 0.0)
+    raw         = call_ai(CATEGORIZATION_PROMPT, student_message)
+    data        = parse_json(raw)
+    confidence  = data.get("confidence", 0.0)
     short_title = data.get("short_title", "Campus Complaint")
 
     if confidence >= 0.75:
@@ -215,14 +223,17 @@ def register_complaint(student_id: str, category_data: dict, raw_message: str) -
         "createdAt": SERVER_TIMESTAMP,
     })
 
-    # ── Fire-and-forget email (non-blocking) ──────────────────────────────
+    # ── Fire-and-forget email ─────────────────────────────────────────────
+    # daemon=False is critical — daemon threads are killed the moment the
+    # HTTP response is sent; non-daemon threads finish even after the response.
     admin_id    = routing.get("adminId", "")
     admin_email = routing.get("adminEmail", "")
+    print(f"[EMAIL DEBUG] admin_id={admin_id!r}  admin_email={admin_email!r}")
     if admin_email and admin_id != "unassigned":
         admin_info = get_admin_info(admin_id)
         threading.Thread(
-            target=email_admin_new_complaint,
-            kwargs={
+            target=_fire_email,
+            args=(email_admin_new_complaint, {
                 "admin_email":      admin_email,
                 "admin_name":       admin_info.get("displayName", "Admin"),
                 "student_name":     student.get("displayName", "Unknown"),
@@ -233,9 +244,11 @@ def register_complaint(student_id: str, category_data: dict, raw_message: str) -
                 "room_number":      student.get("roomNumber", "N/A"),
                 "contact_number":   student.get("contactNumber", "N/A"),
                 "roll_number":      student.get("rollNumber", "N/A"),
-            },
-            daemon=True,
+            }),
+            daemon=False,   # ← non-daemon: thread outlives the HTTP response
         ).start()
+    else:
+        print("[EMAIL DEBUG] Skipped — no admin routed for this category or email missing")
 
     category = category_data.get("category", "General")
     return {
@@ -286,32 +299,32 @@ def admin_send_message(complaint_id: str, response: str, status_update: str) -> 
         "lastUpdated":   SERVER_TIMESTAMP,
     })
 
-    # ── Fire-and-forget email (non-blocking) ──────────────────────────────
+    # ── Fire-and-forget email — daemon=False ──────────────────────────────
     student_email = complaint_data.get("email", "")
     if student_email:
         if status_update == "resolved":
             threading.Thread(
-                target=email_student_resolved,
-                kwargs={
+                target=_fire_email,
+                args=(email_student_resolved, {
                     "student_email":  student_email,
                     "student_name":   complaint_data.get("studentName", "Student"),
                     "tracking_id":    complaint_data.get("trackingId", ""),
                     "short_title":    complaint_data.get("shortTitle", ""),
                     "admin_response": response,
-                },
-                daemon=True,
+                }),
+                daemon=False,
             ).start()
         else:
             threading.Thread(
-                target=email_student_admin_replied,
-                kwargs={
+                target=_fire_email,
+                args=(email_student_admin_replied, {
                     "student_email":  student_email,
                     "student_name":   complaint_data.get("studentName", "Student"),
                     "tracking_id":    complaint_data.get("trackingId", ""),
                     "short_title":    complaint_data.get("shortTitle", ""),
                     "admin_response": response,
-                },
-                daemon=True,
+                }),
+                daemon=False,
             ).start()
 
     return {"success": True}
@@ -336,23 +349,23 @@ def student_reply(complaint_id: str, raw_message: str) -> dict:
         "lastUpdated": SERVER_TIMESTAMP,
     })
 
-    # ── Fire-and-forget email (non-blocking) ──────────────────────────────
+    # ── Fire-and-forget email — daemon=False ──────────────────────────────
     admin_id = complaint_data.get("assignedAdminId", "")
     if admin_id and admin_id != "unassigned":
         admin_info  = get_admin_info(admin_id)
         admin_email = admin_info.get("email", "")
         if admin_email:
             threading.Thread(
-                target=email_admin_student_replied,
-                kwargs={
+                target=_fire_email,
+                args=(email_admin_student_replied, {
                     "admin_email":    admin_email,
                     "admin_name":     admin_info.get("displayName", "Admin"),
                     "student_name":   complaint_data.get("studentName", "Student"),
                     "tracking_id":    complaint_data.get("trackingId", ""),
                     "short_title":    complaint_data.get("shortTitle", ""),
                     "enhanced_reply": enhanced,
-                },
-                daemon=True,
+                }),
+                daemon=False,
             ).start()
 
     return {
